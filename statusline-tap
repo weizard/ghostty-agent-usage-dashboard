@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Record the rate limits Claude Code hands its status line, then step aside.
+
+Claude Code publishes the 5h/7d windows only to the status line command, so a
+reader outside the session has no other way to learn them. Wrap an existing
+status line by passing it as arguments — it is run as a program with those
+arguments, not through a shell, so wrap a shell command string in `sh -c`.
+Caching is best effort: the wrapped status line still renders if it fails.
+"""
+
+import fcntl
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("AGENT_USAGE_STATE_DIR")
+                 or Path.home() / ".config" / "agent-usage").expanduser()
+CACHE = STATE_DIR / "claude-rate-limits.json"
+
+
+def finite(value):
+    """A finite float, or None. An int too large to convert counts as neither."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def epoch(value):
+    """An epoch from a number or an ISO 8601 string, honouring its offset.
+
+    Kept identical in agent-usage: the two read the same cache, and a parser
+    that disagrees makes them disagree about the same window.
+    """
+    plain = finite(value)
+    if plain is not None:
+        return plain
+    if not isinstance(value, str):
+        return None
+    text = value.strip().replace(" ", "T", 1)
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)          # +0000 -> +00:00
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text)
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # A naive string carries no zone, and guessing one is how these two came
+    # to disagree about the same cached window.
+    return None if stamp.tzinfo is None else stamp.timestamp()
+
+
+def window_reset(window):
+    """When this window resets, or None if it carries no usable reset."""
+    return epoch(mapping(window).get("resets_at"))
+
+
+def stored(window):
+    """The window as cached: its reset normalised to an epoch, or dropped.
+
+    The cache is read by another program; leaving the original string there
+    would let the two parse it apart again.
+    """
+    entry = dict(mapping(window))
+    reset = window_reset(window)
+    if reset is None:
+        entry.pop("resets_at", None)
+    else:
+        entry["resets_at"] = reset
+    return entry
+
+
+def window_key(window):
+    """Rank windows: a later reset wins; within one reset, the higher value."""
+    pct = finite(mapping(window).get("used_percentage"))
+    if pct is None:
+        return None
+    reset = window_reset(window)
+    # Without a known reset only the high-water value can advance.
+    return (reset if reset is not None else -math.inf), pct
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def record(payload):
+    limits = payload.get("rate_limits")
+    reported = isinstance(limits, dict) and bool(limits)
+    limits = limits if isinstance(limits, dict) else {}
+    model = payload.get("model")
+    name = model.get("display_name") if isinstance(model, dict) else None
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # Serialise the read/merge/replace so concurrent sessions cannot lose a high.
+    with (STATE_DIR / ".rate-limits.lock").open("a") as lock:
+        deadline = time.monotonic() + 0.2
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.01)
+        try:
+            previous = json.loads(CACHE.read_text())
+        except (OSError, ValueError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        now = time.time()
+        old_limits = previous.get("rate_limits")
+        merged = dict(old_limits) if isinstance(old_limits, dict) else {}
+        changed = False
+        for key in ("five_hour", "seven_day"):
+            incoming, old = window_key(limits.get(key)), window_key(merged.get(key))
+            # A window whose reset has passed describes a window that is gone.
+            # Cached: anything current outranks it however high it stood.
+            # Incoming: it cannot describe the current window at all, so it
+            # neither replaces the cache nor counts as a change.
+            incoming_reset = window_reset(limits.get(key))
+            if incoming_reset is not None and incoming_reset <= now:
+                incoming = None
+            old_reset = window_reset(merged.get(key))
+            if old_reset is not None and old_reset <= now:
+                old = None
+            if incoming is not None and (old is None or incoming > old):
+                merged[key] = stored(limits[key])
+                changed = True
+        entry = {
+            "rate_limits": merged,
+            "rate_limits_reported": bool(previous.get("rate_limits_reported") or reported),
+            "model": name if isinstance(name, str) and name.strip()
+                     else previous.get("model"),
+            # Observation age and high-water change age answer different questions.
+            "taken_at": now if changed else previous.get("taken_at", now),
+            "observed_at": now,
+        }
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".rate-limits-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(entry, handle)
+            os.replace(tmp, CACHE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def main():
+    if sys.stdin.isatty():
+        # Run by hand rather than as a status line: say so instead of looking
+        # like a hang while waiting for input that will never come.
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    # Bytes throughout: a status line must still render when its input is not
+    # valid UTF-8, and json.loads and subprocess both accept bytes.
+    raw = sys.stdin.buffer.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        try:
+            record(payload)
+        except Exception:
+            pass                                      # never block the status line
+    if len(sys.argv) > 1:
+        try:
+            code = subprocess.run(sys.argv[1:], input=raw).returncode
+            return 128 - code if code < 0 else code
+        except OSError as exc:
+            print("statusline-tap: cannot run %s: %s" % (sys.argv[1], exc), file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

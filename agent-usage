@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Read how much of each agent's rate-limit window has been used.
+
+Neither agent offers a way to ask for this, so both numbers are snapshots left
+behind while the agent was running: Claude Code hands them to whatever command
+serves as its status line (see statusline-tap), and Codex writes them into its
+own session rollout. Every reading therefore carries the moment it was taken,
+and a window whose reset has already passed reports nothing rather than a
+percentage that no longer describes anything.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+CORALLINE = Path.home() / ".claude" / "coralline"
+STATE_DIR = Path(os.environ.get("AGENT_USAGE_STATE_DIR")
+                 or Path.home() / ".config" / "agent-usage").expanduser()
+CLAUDE_TAP = STATE_DIR / "claude-rate-limits.json"
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+
+SLOTS = ("short", "long")
+SKEW_TOLERANCE = 60        # seconds a timestamp may lead this clock before it is skew
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+# ── parsing helpers ─────────────────────────────────────────────────────────
+
+def number(value):
+    """A finite number, or None. Booleans are not numbers here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:                             # an int too large to be one
+        return None
+    return value if math.isfinite(value) else None
+
+
+def epoch(value):
+    """An epoch from a number or an ISO 8601 string, honouring its offset.
+
+    Kept identical in statusline-tap: the two read the same cache, and a parser
+    that disagrees makes them disagree about the same window.
+    """
+    plain = number(value)
+    if plain is not None:
+        return plain
+    if not isinstance(value, str):
+        return None
+    text = value.strip().replace(" ", "T", 1)
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    text = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)          # +0000 -> +00:00
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text)
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # A naive string carries no zone, and guessing one is how these two came
+    # to disagree about the same cached window.
+    return None if stamp.tzinfo is None else stamp.timestamp()
+
+
+def sanitize(text):
+    """Strip control characters from anything that reaches a terminal."""
+    return CONTROL.sub("", text) if isinstance(text, str) else text
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (ValueError, OSError):
+        return None
+
+
+# ── readings ────────────────────────────────────────────────────────────────
+
+class Window:
+    """One rate-limit window: how much is used, and when it resets."""
+
+    def __init__(self, pct, resets_at, label):
+        self.pct = pct
+        self.resets_at = resets_at
+        self.label = label
+
+    def expired(self, now):
+        """Past its reset, so the percentage describes a window that is gone."""
+        return self.resets_at is not None and self.resets_at <= now
+
+    @classmethod
+    def build(cls, raw, pct_key, label):
+        raw = mapping(raw)
+        pct = number(raw.get(pct_key))
+        return None if pct is None else cls(pct, epoch(raw.get("resets_at")), label)
+
+
+class Reading:
+    """What one agent last published, or why nothing could be read."""
+
+    def __init__(self, label):
+        self.label = label
+        self.windows = {"short": None, "long": None}
+        self.taken_at = None
+        self.observed_at = None
+        self.model = None
+        self.error = None
+        self.age_kind = "snapshot"
+
+    @property
+    def empty(self):
+        return not any(self.windows.values())
+
+    def stamp(self):
+        """The timestamp this reading's age is measured from."""
+        return self.observed_at if self.age_kind == "observation" else self.taken_at
+
+    def skewed(self, now):
+        """True when the timestamp leads this clock by more than tolerance.
+
+        A timestamp ahead of the clock says nothing about how old the reading
+        is, so it is reported as skew rather than as an age of zero.
+        """
+        stamp = self.stamp()
+        return stamp is not None and stamp > now + SKEW_TOLERANCE
+
+    def age(self, now):
+        stamp = self.stamp()
+        return None if stamp is None else max(0.0, now - stamp)
+
+    def stale(self, after, now):
+        age = self.age(now)
+        return age is None or age > after or self.skewed(now)
+
+
+def guarded(label, read):
+    """Turn source I/O and malformed data failures into a stated error."""
+    try:
+        return read()
+    except (OSError, ValueError, UnicodeError) as exc:
+        reading = Reading(label)
+        reading.error = "%s: %s" % (type(exc).__name__, exc)
+        return reading
+
+
+# ── Claude Code ─────────────────────────────────────────────────────────────
+
+def claude_model():
+    """The session model the tap last saw, else what settings.json defaults to."""
+    model = mapping(load_json(CLAUDE_TAP)).get("model")
+    if isinstance(model, str) and model.strip():
+        return sanitize(model.strip())
+    model = mapping(load_json(CLAUDE_SETTINGS)).get("model")
+    return sanitize(model.strip()) if isinstance(model, str) and model.strip() else None
+
+
+def read_claude_tap():
+    """What statusline-tap recorded, if it serves as the status line."""
+    r = Reading("CC")
+    r.age_kind = "observation"
+    if not CLAUDE_TAP.is_file():
+        r.error = "no statusline-tap cache"
+        return r
+    data = load_json(CLAUDE_TAP)
+    if data is None:
+        r.error = "unreadable statusline-tap cache"
+        return r
+    taken = number(mapping(data).get("taken_at"))
+    if taken is None:
+        r.error = "statusline-tap cache has no timestamp"
+        return r
+    r.taken_at = taken
+    # A cache written before observed_at existed still describes a real
+    # observation; without this it would read as "never observed".
+    r.observed_at = number(mapping(data).get("observed_at"))
+    if r.observed_at is None:
+        r.observed_at = taken
+    limits = mapping(mapping(data).get("rate_limits"))
+    for slot, key, label in (("short", "five_hour", "5h"), ("long", "seven_day", "7d")):
+        r.windows[slot] = Window.build(limits.get(key), "used_percentage", label)
+    if r.empty:
+        r.error = ("this Claude Code session does not report rate limits"
+                   if mapping(data).get("rate_limits_reported") is False else
+                   "no current window in the tap cache")
+        return r
+    return r
+
+
+def read_claude_coralline():
+    """Coralline's cross-session high-water store, when VL_LIMIT_SYNC is on.
+
+    Entries are named "<resets_at>_<pct>", zero padded so the lexical maximum
+    is the latest window, and an entry's mtime is when a session recorded it.
+    """
+    r = Reading("CC")
+    r.age_kind = "last_change"
+    stores = {"short": (CORALLINE / "limit-5h.d", "5h"), "long": (CORALLINE / "limit-7d.d", "7d")}
+    if not all(d.is_dir() for d, _ in stores.values()):
+        r.error = "no coralline store"
+        return r
+    for key, (store, label) in stores.items():
+        try:
+            entries = sorted(e for e in os.listdir(store) if e[:1].isdigit())
+        except OSError:
+            continue
+        for name in reversed(entries):
+            resets, _, pct = name.partition("_")
+            try:
+                value, reset = number(float(pct)), int(resets)
+                taken = (store / name).stat().st_mtime
+            except (ValueError, OSError):
+                continue                              # entry vanished or is junk
+            if value is None:
+                continue                              # a NaN or inf would poison every format
+            window = Window(value, reset, label)
+            r.windows[key] = window
+            r.taken_at = taken if r.taken_at is None else max(r.taken_at, taken)
+            break
+    if r.empty:
+        r.error = "coralline store is empty"
+    return r
+
+
+def read_claude():
+    """The freshest of the ways a Claude session can publish its limits."""
+    sources = [guarded("CC", read_claude_tap), guarded("CC", read_claude_coralline)]
+    usable = [r for r in sources if not r.error]
+    if not usable:
+        r = Reading("CC")
+        r.error = (sources[0].error if CLAUDE_TAP.is_file() else
+                   sources[1].error if sources[1].error != "no coralline store" else
+                   "no tap installed (install statusline-tap as the status line, "
+                   "or set VL_LIMIT_SYNC=1 in ~/.claude/coralline.conf)")
+        return r
+    now = time.time()
+    # A skewed timestamp clamps to an age of zero, so without this it would
+    # always win the freshness comparison against a trustworthy reading.
+    best = min(usable, key=lambda r: (r.skewed(now),
+                                      r.age(now) if r.age(now) is not None else math.inf))
+    best.model = claude_model()
+    return best
+
+
+# ── Codex ───────────────────────────────────────────────────────────────────
+
+def codex_model():
+    """Model and effort from the root table and the selected profile."""
+    try:
+        lines = CODEX_CONFIG.read_text().splitlines()
+    except OSError:
+        return None
+    root, profiles, section = {}, {}, None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            match = re.fullmatch(r"""\[profiles\.(?:"([^"\\]+)"|'([^']+)'|([\w-]+))\]\s*(?:#.*)?""", stripped)
+            section = next((v for v in match.groups() if v is not None), None) if match else ""
+            continue
+        key, sep, value = stripped.partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if value[:1] in ("'", '"'):                   # quoted: the comment is outside
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end > 0 else value[1:]
+        else:
+            value = value.split("#", 1)[0].strip()
+        if section is None:
+            root[key.strip()] = value
+        elif section:
+            profiles.setdefault(section, {})[key.strip()] = value
+    found = dict(root)
+    found.update(profiles.get(root.get("profile"), {}))
+    model = found.get("model")
+    effort = found.get("model_reasoning_effort")
+    if not model:
+        return None
+    return sanitize("%s (%s)" % (model, effort) if effort else model)
+
+
+def duration_minutes(value):
+    """A window length in whole minutes, or None if it is not one."""
+    minutes = number(value)
+    if minutes is None or minutes <= 0 or minutes != int(minutes) or minutes > 527040:
+        return None
+    return int(minutes)
+
+
+def window_label(minutes):
+    """Name a window by the duration Codex reports for it."""
+    if minutes is None:
+        return None
+    total = int(minutes)
+    if total % 1440 == 0:
+        return "%dd" % (total // 1440)
+    if total % 60 == 0:
+        return "%dh" % (total // 60)
+    return "%dm" % total
+
+
+def matching_lines(path, needle, chunk=65536):
+    """Every line of `path` containing `needle`, newest first."""
+    needle = needle.encode()
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        tail = b""
+        while end > 0:
+            start = max(0, end - chunk)
+            handle.seek(start)
+            buf = handle.read(end - start) + tail
+            lines = buf.split(b"\n")
+            # The first element may be a partial line; carry it to the next pass.
+            tail = lines.pop(0) if start > 0 else b""
+            for line in reversed(lines):
+                if needle in line:
+                    yield line
+            end = start
+
+
+GENERAL_BUCKET = "codex"
+
+
+def codex_snapshot(path, seen_buckets):
+    """The newest usable rate-limit event in one rollout, as (taken_at, limits).
+
+    A rollout being appended to can end mid-line, so earlier events are tried
+    rather than writing the whole file off.
+    """
+    for line in matching_lines(path, '"rate_limits"'):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        limits = mapping(mapping(event).get("payload")).get("rate_limits")
+        if not isinstance(limits, dict):
+            continue
+        bucket = limits.get("limit_id")
+        if bucket is not None and bucket != GENERAL_BUCKET:
+            seen_buckets.add(str(bucket))
+            continue
+        if not any(number(mapping(limits.get(k)).get("used_percent")) is not None
+                   for k in ("primary", "secondary")):
+            continue
+        taken = epoch(mapping(event).get("timestamp"))
+        if taken is None:
+            try:
+                taken = path.stat().st_mtime
+            except OSError:
+                continue
+        return taken, limits
+    return None
+
+
+def read_codex():
+    """The freshest snapshot among the newest rollouts.
+
+    File mtime does not rank the readings — a session touched recently may
+    carry an old last snapshot — so candidates are parsed and the newest wins.
+    """
+    r = Reading("CX")
+    if not CODEX_SESSIONS.is_dir():
+        r.error = "no ~/.codex/sessions"
+        return r
+    candidates = []
+    try:
+        rollouts = CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl")
+        for path in rollouts:
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                continue                              # vanished mid-scan
+    except OSError:
+        r.error = "cannot list ~/.codex/sessions"
+        return r
+    if not candidates:
+        r.error = "no session rollouts"
+        return r
+    candidates.sort(reverse=True)
+    snapshots, seen_buckets = [], set()
+    for _, path in candidates[:8]:
+        try:
+            snapshot = codex_snapshot(path, seen_buckets)
+        except OSError:
+            continue
+        if snapshot:
+            snapshots.append(snapshot)
+    if not snapshots:
+        r.error = "no %s quota in the %d newest rollouts" % (GENERAL_BUCKET, min(len(candidates), 8))
+        if seen_buckets:
+            r.error += " (saw %s)" % ", ".join(sorted(seen_buckets))
+        return r
+    # A rollout timestamped ahead of this clock says nothing about now, so a
+    # trustworthy snapshot outranks it however much newer it claims to be.
+    now = time.time()
+    r.taken_at, limits = min(snapshots,
+                             key=lambda snap: (snap[0] > now + SKEW_TOLERANCE, -snap[0]))
+    r.model = codex_model()
+    buckets = []
+    for raw, legacy_minutes, legacy_label in (("primary", 300, "5h"), ("secondary", 10080, "7d")):
+        window = Window.build(limits.get(raw), "used_percent", legacy_label)
+        if window is None:
+            continue
+        minutes = duration_minutes(mapping(limits.get(raw)).get("window_minutes"))
+        window.label = window_label(minutes) or legacy_label
+        buckets.append((minutes or legacy_minutes, window))
+    buckets.sort(key=lambda bucket: bucket[0])
+    for slot, (_, window) in zip(SLOTS, buckets):
+        r.windows[slot] = window
+    return r
+
+
+# ── rendering ───────────────────────────────────────────────────────────────
+
+def countdown(window, now, tight=False):
+    if window is None or window.resets_at is None:
+        return ""
+    secs = int(window.resets_at - now)
+    if secs <= 0:
+        return "reset"
+    if secs >= 86400:
+        return "%dd%dh" % (secs // 86400, secs % 86400 // 3600)
+    if secs >= 3600:
+        return "%dh%02d%s" % (secs // 3600, secs % 3600 // 60, "" if tight else "m")
+    return "%dm" % (secs // 60)
+
+
+def percent(window, now):
+    return "–" if window is None or window.expired(now) else "%d%%" % round(window.pct)
+
+
+def age_text(seconds):
+    return ("–" if seconds is None else "%dh ago" % (seconds // 3600)
+            if seconds >= 3600 else "%dm ago" % (seconds // 60))
+
+
+def render(readings, fmt, stale_after):
+    now = time.time()
+    if fmt == "json":
+        out = {}
+        for r in readings:
+            windows = {}
+            for slot in SLOTS:
+                w = r.windows[slot]
+                windows[slot + "_window"] = {
+                    "label": None if w is None else w.label,
+                    "state": "missing" if w is None else "expired" if w.expired(now) else "ok",
+                    "used_pct": None if w is None or w.expired(now) else w.pct,
+                    "resets_at": None if w is None else w.resets_at,
+                }
+            out[r.label] = dict(windows, model=r.model, error=r.error, age_kind=r.age_kind,
+                                clock_skew=r.skewed(now),
+                                taken_at=r.taken_at, observed_at=r.observed_at,
+                                age_seconds=None if r.age(now) is None else round(r.age(now)),
+                                stale=r.stale(stale_after, now))
+        return json.dumps(out, indent=1)
+
+    lines = []
+    for r in readings:
+        mark = "" if not r.stale(stale_after, now) else "?"
+        if r.error:
+            lines.append("%s %s" % (r.label, "–" if fmt == "line" else sanitize(r.error)))
+            continue
+        if fmt == "line":
+            parts = []
+            for slot in SLOTS:
+                w = r.windows[slot]
+                left = countdown(w, now, tight=True)
+                parts.append("%s%s" % (percent(w, now), "↺" + left if left and not (
+                    w is None or w.expired(now)) else ""))
+            lines.append("%s %s%s" % (r.label, " · ".join(parts), mark))
+        else:
+            age = age_text(r.age(now))
+            if r.skewed(now):
+                age = "timestamp ahead of this clock"
+            elif r.age_kind == "last_change":
+                age = "last change " + age
+            elif r.age_kind == "observation":
+                changed = None if r.taken_at is None else max(0.0, now - r.taken_at)
+                age = "last observed %s; last change %s" % (age, age_text(changed))
+            body = "   ".join(
+                "%s %s (↺%s)" % (r.windows[slot].label if r.windows[slot] else "–",
+                                 percent(r.windows[slot], now),
+                                 countdown(r.windows[slot], now) or "–")
+                for slot in SLOTS)
+            lines.append("%s  %s   [%s]%s" % (r.label, body, age,
+                                              "   %s" % r.model if r.model else ""))
+    return ("  │  " if fmt == "line" else "\n").join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--format", choices=("detail", "line", "json"), default="detail")
+    p.add_argument("--stale-after", type=int, default=1800,
+                   help="seconds after which a reading is marked stale (default 1800)")
+    args = p.parse_args()
+    readings = [guarded("CC", read_claude), guarded("CX", read_codex)]
+    print(render(readings, args.format, args.stale_after))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
