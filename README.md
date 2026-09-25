@@ -5,18 +5,7 @@ and dismissed with Esc or a click anywhere outside. It does not take a menu bar
 slot, does not touch your tab names, and does not compete with anything for the
 window title.
 
-```
-  Claude Code  ·  opus
-     5h  █████████░░░░░░░░░░░░░   43%   48m
-     7d  █████░░░░░░░░░░░░░░░░░   22%   5d 9h
-
-  Codex  ·  gpt-6-astra (high)
-     5h  █████████░░░░░░░░░░░░░   39%   2h 43m
-     7d  ███████████░░░░░░░░░░░   52%   3d 21h
-     ↑ snapshot from 73m ago
-
-  Esc / q close   ·   s shell (exit returns here)   ·   every 5s
-```
+![The panel in Ghostty's quick terminal](docs/panel.png)
 
 ## How it gets the numbers
 
@@ -51,6 +40,21 @@ Because the readings are snapshots, the panel says how old they are:
 
 Coralline ages are labelled `last change`: unchanged usage does not update its
 store, so its age cannot show whether Claude Code is running.
+
+A stale source is annotated in place, under the windows it applies to:
+
+```
+  Claude Code  ·  opus
+     5h  █████████░░░░░░░░░░░░░   43%   48m
+     7d  █████░░░░░░░░░░░░░░░░░   22%   5d 9h
+
+  Codex  ·  gpt-6-astra (high)
+     5h  █████████░░░░░░░░░░░░░   39%   2h 43m
+     7d  ███████████░░░░░░░░░░░   52%   3d 21h
+     ↑ snapshot from 73m ago
+
+  Esc / q close   ·   s shell (exit returns here)   ·   every 5s
+```
 
 The display side is Ghostty's **quick terminal**: it is the only surface with
 `GHOSTTY_QUICK_TERMINAL=1` set, so the shell hook there hands over to the panel
